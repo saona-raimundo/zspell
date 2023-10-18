@@ -1,0 +1,113 @@
+---
+name: Rust Validation
+
+on:
+  push:
+    branches:
+    - main
+  pull_request:
+  workflow_call: # allow this to be run from other workflows
+
+env:
+  RUSTDOCFLAGS: -D warnings
+  RUSTFLAGS: -D warnings
+  RUST_BACKTRACE: 1
+  CARGO_UNSTABLE_SPARSE_REGISTRY: true
+
+jobs:
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-features --all-targets -- -D warnings
+      - run: cargo clippy --no-default-features --all-targets --features benchmarking -- -D warnings
+
+  min_versions:
+    name: check minimum rustc version
+    runs-on: ubuntu-latest
+    env:
+      # we don't care about unused with these feature configurations
+      RUSTFLAGS: -A unused
+    steps:
+      - uses: actions/checkout@v3
+      - uses: dtolnay/rust-toolchain@1.65
+      - uses: Swatinem/rust-cache@v2
+        # check only zspell; we can use later for the CLI
+      - run: cargo check -p zspell --all-features
+      - run: cargo check -p zspell --no-default-features --features benchmarking
+
+  test:
+    strategy:
+        fail-fast: true
+        matrix:
+          os: [ubuntu-latest, windows-latest, macos-latest]
+          include:
+            - os: ubuntu-latest
+              name: linux
+            - os: windows-latest
+              name: windows
+            - os: macos-latest
+              name: mac
+    name: "test on ${{ matrix.name }}"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v3
+      - name: List files
+        run: |
+          pwd
+          ls
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+      - run: cargo test
+
+  fmt:
+    name: formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+            components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - uses: actions/setup-python@v3
+      - name: Validate pre-commit
+        uses: pre-commit/action@v3.0.0
+
+  doc:
+    name: docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc
+
+  book:
+    name: book
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          mkdir -p ~/mdbook
+          # Tar is weird with ~ as home
+          curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.4.21/mdbook-v0.4.21-x86_64-unknown-linux-gnu.tar.gz \
+          | tar -xz --directory=$(echo ~)/mdbook
+      - run: ~/mdbook/mdbook test
+
+  # Make sure we turned the clippy lint off
+  verify_fixme_critical:
+    name: verify critical fixmes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - run: grep -r "FIXME:CRIT" --exclude-dir="target" --exclude-dir=".git" --exclude="validation-rust.yaml" && exit 1 || exit 0
