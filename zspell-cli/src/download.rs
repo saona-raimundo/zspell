@@ -1,10 +1,11 @@
-//! Things required to download dictionaries
+//! Things required to download dictionaries from wooorm's repository
 //!
 //! This is a work in progress; entire section is largely unfinished
+// TODO: should this move to `zspell` under a feature?
 
 #![allow(unused)] // WIP
 
-use std::cmp::min;
+use std::cmp::{max, min};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, Write};
 use std::path::Path;
@@ -12,9 +13,8 @@ use std::time::Duration;
 
 use anyhow::{bail, Context};
 use cfg_if::cfg_if;
-use futures_util::StreamExt;
 use indicatif::{ProgressBar, ProgressStyle};
-use reqwest::Client;
+use serde::Deserialize;
 use serde_json::Value;
 use sha1::{Digest, Sha1};
 
@@ -25,12 +25,19 @@ const APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PK
 cfg_if! {
     if #[cfg(not(test))] {
         const ROOT_URL: &str = "https://api.github.com/repos/wooorm/dictionaries/contents/dictionaries";
+        fn get_root_url() -> String {
+            ROOT_URL.to_owned()
+        }
     } else {
         use lazy_static::lazy_static;
         use httpmock::prelude::*;
 
         lazy_static!{
             static ref TEST_SERVER: MockServer = MockServer::start();
+        }
+
+        fn get_root_url() -> String {
+            TEST_SERVER.url("/content/dictionaries")
         }
     }
 }
@@ -49,14 +56,14 @@ struct DownloadInfo {
 ///
 /// Implementation taken from the git help page, located here
 /// <https://git-scm.com/book/en/v2/Git-Internals-Git-Objects>
-fn calculate_git_hash(s: &str) -> [u8; 20] {
-    let mut tmp = String::from("blob ");
-    tmp.push_str(&s.len().to_string());
-    tmp.push('\0');
-    tmp.push_str(s);
+fn calculate_git_hash(bytes: &[u8]) -> [u8; 20] {
+    let mut tmp = Vec::from(b"blob ".as_slice());
+    tmp.extend_from_slice(bytes.len().to_string().as_bytes());
+    tmp.push(b'\0');
+    tmp.extend_from_slice(bytes);
 
     let mut hasher = Sha1::new();
-    hasher.update(tmp.as_bytes());
+    hasher.update(&tmp);
     let res: [u8; 20] = hasher.finalize().into();
     res
 }
@@ -84,61 +91,53 @@ fn calculate_git_hash_buf<R: Read>(mut reader: R, len: usize) -> anyhow::Result<
     Ok(res)
 }
 
-/// Helper function for getting the root URL that we can "patch" for testing
-fn get_root_url() -> String {
-    #[cfg(not(test))]
-    return ROOT_URL.to_owned();
+/// Contents of a directory
+#[derive(Debug, Deserialize)]
+struct Tree(Vec<Listing>);
 
-    #[cfg(test)]
-    return TEST_SERVER.url("/contents/dictionaries");
+#[derive(Debug, Deserialize)]
+struct Listing {
+    name: String,
+    path: String,
+    size: usize,
+    sha: Option<String>,
+    url: String,
+    html_url: String,
+    download_url: Option<String>,
+    git_url: String,
+    #[serde(rename = "type")]
+    ty: String,
 }
 
 /// Gather the URLs to download dictionary, affix, and license files from a client
 ///
 /// Only collects the URLs, does not download them. Uses [`get_root_url`]
 /// as a base then navigates one layer deeper.
-async fn retrieve_urls(lang: &str, client: &Client) -> anyhow::Result<DownloadInfo> {
-    let root_json: Value = client
-        .get(get_root_url())
-        .send()
-        .await
-        .context("error while sending request")?
-        .text()
-        .await
-        .map(|txt| {
-            serde_json::from_str(&txt).context("error understanding server response at root")
-        })??;
+fn retrieve_urls(lang: &str, agent: &ureq::Agent) -> anyhow::Result<DownloadInfo> {
+    let tree: Tree = agent
+        .get(&get_root_url())
+        .call()
+        .context("requesting root listing")?
+        .into_json()?;
 
     // Get the URL of the directory to download
-    let dir_url = root_json
-        .as_array()
-        .context("Data is incorrectly formatted")?
+    let dir_url = tree
+        .0
         .iter()
-        .find(|x| x["name"] == lang && x["type"] == "dir")
-        .map(|x| &x["url"])
-        .context("Unable to locate language")?
-        .as_str()
-        .context("Data is incorrectly formatted")?;
+        .find(|v| v.name == lang && v.ty == "dir")
+        .map(|v| &v.url)
+        .context("locating selected language")?;
 
     // Get the listing of that directory
-    let dir_json: Value = client
+    let dir_tree: Tree = agent
         .get(dir_url)
-        .send()
-        .await
-        .context("error while sending request")?
-        .text()
-        .await
-        .map(|txt| {
-            serde_json::from_str(&txt).context("error understanding server response at dir")
-        })??;
+        .call()
+        .context("requesting dictionary listing")?
+        .into_json()?;
 
-    let dir_listing = &dir_json
-        .as_array()
-        .context("error listing server directory")?;
-
-    let affix = get_dl_url_from_tree(dir_listing, |s| s.ends_with(".aff"))?;
-    let dictionary = get_dl_url_from_tree(dir_listing, |s| s.ends_with(".dic"))?;
-    let license = get_dl_url_from_tree(dir_listing, |s| s.ends_with("license"))?;
+    let affix = get_dl_url_from_tree(&dir_tree, |s| s.ends_with(".aff"))?;
+    let dictionary = get_dl_url_from_tree(&dir_tree, |s| s.ends_with(".dic"))?;
+    let license = get_dl_url_from_tree(&dir_tree, |s| s.ends_with("license"))?;
 
     let res = DownloadInfo {
         affix,
@@ -150,20 +149,21 @@ async fn retrieve_urls(lang: &str, client: &Client) -> anyhow::Result<DownloadIn
     Ok(res)
 }
 
-/// Take in a JSON tree and locate one where the name matches the specified pattern
-fn get_dl_url_from_tree<F: Fn(&str) -> bool>(tree: &[Value], f: F) -> anyhow::Result<String> {
+/// Take in a file tree and locate one where the name matches the specified pattern
+fn get_dl_url_from_tree<F: Fn(&str) -> bool>(tree: &Tree, f: F) -> anyhow::Result<String> {
     let ctx_str = "could not locate a necessary file";
     // Collect the SHA sum and download URL of a file
     let tmp = tree
+        .0
         .iter()
-        .find(|x| x["name"].as_str().map(&f).unwrap_or(false))
-        .map(|x| (x.get("sha"), x.get("download_url")))
+        .find(|v| f(&v.name))
+        .map(|v| (&v.sha, &v.download_url))
         .context(ctx_str)?;
 
     let mut res = String::from("sha1$");
-    res.push_str(tmp.0.context(ctx_str)?.as_str().context(ctx_str)?);
+    res.push_str(tmp.0.as_ref().context(ctx_str)?.as_str());
     res.push('$');
-    res.push_str(tmp.1.context(ctx_str)?.as_str().context(ctx_str)?);
+    res.push_str(tmp.1.as_ref().context(ctx_str)?.as_str());
 
     Ok(res)
 }
@@ -185,7 +185,7 @@ fn open_new_file(path: &Path, overwrite: bool) -> anyhow::Result<File> {
             .read(true)
             .create(true)
             .open(path)
-            .context(format!("unable to open \"{fname}\" in \"{dir}\""))
+            .context(format!("unable to open '{fname}' in '{dir}'"))
     } else {
         // Otherwise, use create_new to fail if it exists
         OpenOptions::new()
@@ -193,46 +193,55 @@ fn open_new_file(path: &Path, overwrite: bool) -> anyhow::Result<File> {
             .read(true)
             .create_new(true)
             .open(path)
-            .context(format!("file {fname} already exists in \"{dir}\""))
+            .context(format!("file {fname} already exists in '{dir}'"))
     }
 }
 
 // Download a single file to the given path, and create a progress bar while
-// doing so
-async fn download_file_with_bar(
+// doing so.
+fn download_file_with_bar(
     path: &Path,
     overwrite: bool,
-    client: &Client,
+    agent: &ureq::Agent,
     url: &str,
     sha: &[u8],
 ) -> anyhow::Result<()> {
+    const CHUNK_SIZE: usize = 100;
+
     let mut buffer = open_new_file(path, overwrite)?;
+    let resp = agent.get(url).call()?;
 
-    let res = client.get(url).send().await?;
-    let total_size = res.content_length().unwrap_or(100);
+    // Estimate content length for our buffer capacity & progress bar
+    let expected_len = match resp.header("Content-Length") {
+        Some(hdr) => hdr.parse().expect("can't parse number"),
+        None => 100,
+    };
 
-    let pb = ProgressBar::new(total_size);
+    let mut buf_len = 0usize;
+    let mut buffer: Vec<u8> = Vec::with_capacity(expected_len);
+    let mut reader = resp.into_reader().take(10_000_000);
+
+    let pb = ProgressBar::new(expected_len.try_into().unwrap());
     pb.set_style(ProgressStyle::default_bar()
         .template("{msg}\n{spinner:.green} [{elapsed_precise}] [{bar:.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")?
         .progress_chars("#>-"));
     pb.set_message(format!("Downloading {url}"));
 
-    let mut finished_bytes: u64 = 0;
-    let mut stream = res.bytes_stream();
+    loop {
+        buffer.extend_from_slice(&[0; CHUNK_SIZE]);
+        let chunk = &mut buffer.as_mut_slice()[buf_len..buf_len + CHUNK_SIZE];
+        let read_bytes = reader.read(chunk).expect("error reading stream");
+        buf_len += read_bytes;
+        pb.set_length(max(read_bytes, expected_len).try_into().unwrap());
+        pb.set_position(buf_len.try_into().unwrap());
 
-    while let Some(item) = stream.next().await {
-        let chunk = item?;
-        buffer.write_all(&chunk)?;
-
-        let new = min(finished_bytes + (chunk.len() as u64), total_size);
-        finished_bytes = new;
-        pb.set_position(new);
+        if read_bytes == 0 {
+            break;
+        }
     }
 
-    let buf_len = buffer.stream_position().unwrap();
-    buffer.rewind().context("error writing file").unwrap();
-
-    let hash = calculate_git_hash_buf(&buffer, buf_len.try_into()?).unwrap();
+    buffer.truncate(buf_len);
+    let hash = calculate_git_hash(&buffer);
 
     if hash != sha {
         bail!("error downloading file; checksum failure");
@@ -244,19 +253,9 @@ async fn download_file_with_bar(
 }
 
 // TODO: make pub
-async fn download_dict(
-    lang: &str,
-    dest: &Path,
-    overwrite: bool,
-    _manifest: &Path,
-) -> anyhow::Result<()> {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(10))
-        .user_agent(APP_USER_AGENT)
-        .build()
-        .context("could not create HTTP client")?;
-
-    let urls = retrieve_urls(lang, &client).await?;
+fn download_dict(lang: &str, dest: &Path, overwrite: bool, _manifest: &Path) -> anyhow::Result<()> {
+    let client = make_client();
+    let urls = retrieve_urls(lang, &client)?;
 
     let fnames = DownloadInfo {
         affix: format!("{lang}.aff"),
@@ -265,14 +264,12 @@ async fn download_dict(
         lang: String::default(),
     };
 
-    // We control these strings, unwrap should be safe
     // Want to split "sha$some_sha_hex$some_url" into (some_sha_hex, some_url)
-
     fn split_url_sha(s: &str) -> (&str, &str) {
-        s.split_once('$')
-            .map(|x| x.1.split_once('$'))
-            .unwrap()
-            .unwrap()
+        let (sha_pfx, rest) = s.split_once('$').unwrap();
+        assert_eq!(sha_pfx, "sha1");
+
+        rest.split_once('$').unwrap()
     }
 
     let info_aff = split_url_sha(urls.affix.as_str());
@@ -285,8 +282,7 @@ async fn download_dict(
         &client,
         info_aff.1,
         hex::decode(info_aff.0.as_bytes())?.as_slice(),
-    )
-    .await?;
+    )?;
 
     download_file_with_bar(
         &dest.join(fnames.dictionary),
@@ -294,8 +290,7 @@ async fn download_dict(
         &client,
         info_dic.1,
         hex::decode(info_dic.0.as_bytes())?.as_slice(),
-    )
-    .await?;
+    )?;
 
     download_file_with_bar(
         &dest.join(fnames.license),
@@ -303,8 +298,7 @@ async fn download_dict(
         &client,
         info_lic.1,
         hex::decode(info_lic.0.as_bytes())?.as_slice(),
-    )
-    .await?;
+    )?;
 
     // Download each with progress bar
     // Hash each file
@@ -313,6 +307,13 @@ async fn download_dict(
     println!("{urls:?}");
 
     Ok(())
+}
+
+fn make_client() -> ureq::Agent {
+    ureq::builder()
+        .timeout(Duration::from_secs(10))
+        .user_agent(APP_USER_AGENT)
+        .build()
 }
 
 #[cfg(test)]
@@ -329,19 +330,20 @@ mod tests {
     fn calculate_git_hash_ok() {
         // Use example from git help page
         assert_eq!(
-            calculate_git_hash("what is up, doc?"),
+            calculate_git_hash("what is up, doc?".as_bytes()),
             hex::decode("bd9dbf5aae1a3862dd1526723246b20206e5fc37")
                 .unwrap()
                 .as_slice()
         )
     }
 
-    #[tokio::test]
-    async fn retreive_urls_ok() {
+    #[test]
+    fn retreive_urls_ok() {
         let mocks = mock_server_setup();
-        let client = make_test_client();
+        let client = make_client();
+        dbg!(&mocks);
 
-        let urls = retrieve_urls("de-AT", &client).await.unwrap();
+        let urls = retrieve_urls("de-AT", &client).unwrap();
         // SHA sums joined with files
         let expected = DownloadInfo {
             affix: format!(
@@ -373,12 +375,12 @@ mod tests {
         assert_eq!(urls, expected);
     }
 
-    #[tokio::test]
-    async fn download_dict_ok() {
+    #[test]
+    fn download_dict_ok() {
         let mocks = mock_server_setup();
         let dir = tempdir().unwrap();
 
-        let res = download_dict("de-AT", dir.path(), false, &PathBuf::default()).await;
+        let res = download_dict("de-AT", dir.path(), false, &PathBuf::default());
 
         println!("{res:?}");
         res.unwrap();
@@ -474,13 +476,5 @@ mod test_mocks {
             de_at_dic,
             de_at_lic,
         }
-    }
-
-    pub fn make_test_client() -> Client {
-        Client::builder()
-            .timeout(Duration::from_secs(5))
-            .user_agent(APP_USER_AGENT)
-            .build()
-            .unwrap()
     }
 }
