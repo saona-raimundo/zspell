@@ -604,13 +604,13 @@ impl<'dict, 'word> WordEntry<'dict, 'word> {
     /// let deriv_sfx = MorphInfo::DerivSfx("able".into());
     ///
     /// # // let entry = dict.entry("drink");
-    /// # // let stems: Vec<_> = entry.analyze().unwrap().collect();
-    /// # //assert_eq!(stems, [&verb_pos]);
+    /// # // let morphs: Vec<_> = entry.analyze().unwrap().collect();
+    /// # //assert_eq!(morphs, [&verb_pos]);
     ///
     /// let entry = dict.entry("drinkable");
-    /// let stems: Vec<_> = entry.analyze().unwrap().collect();
-    /// assert_eq!(stems, [&deriv_sfx])
-    /// # // assert_eq!(stems, [&verb_pos, &deriv_sfx]);
+    /// let morphs: Vec<_> = entry.analyze().unwrap().collect();
+    /// assert_eq!(morphs, [&deriv_sfx])
+    /// # // assert_eq!(morphs, [&verb_pos, &deriv_sfx]);
     /// # // ^ yeah, this isn't a verb, but this is just an example...
     /// ```
     #[inline]
